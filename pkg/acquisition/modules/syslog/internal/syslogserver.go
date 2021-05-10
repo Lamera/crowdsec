@@ -3,59 +3,65 @@ package syslogserver
 import (
 	"fmt"
 	"net"
-	"strings"
 
+	"github.com/pkg/errors"
 	"gopkg.in/tomb.v2"
 )
 
 type SyslogServer struct {
-	proto        string
-	listenAddr   string
-	port         int
-	channel      chan string
-	tcpListener  *net.TCPListener
-	udpConn      *net.UDPConn
-	parsingTombs []*tomb.Tomb
-	acceptTombs  []*tomb.Tomb
-	receiveTombs []*tomb.Tomb
+	listenAddr string
+	port       int
+	channel    chan SyslogMessage
+	udpConn    *net.UDPConn
+	readTomb   *tomb.Tomb
 }
 
-func (s *SyslogServer) SetProtocol(proto string) error {
-	proto = strings.ToLower(proto)
-	if proto != "tcp" && proto != "udp" {
-		return fmt.Errorf("protocol must be tcp or udp, got %s", proto)
-	}
-	s.proto = proto
-	return nil
+type SyslogMessage struct {
+	Message []byte
+	Client  string
 }
 
 func (s *SyslogServer) Listen(listenAddr string, port int) error {
-	switch s.proto {
-	case "tcp":
-		tcpAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", s.listenAddr, s.port))
-		if err != nil {
-			return err
-		}
-		tcpListener, err := net.ListenTCP("tcp", tcpAddr)
-		if err != nil {
-			return err
-		}
-		s.tcpListener = tcpListener
-	case "udp":
-		udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", s.listenAddr, s.port))
-		if err != nil {
-			return err
-		}
-		udpConn, err := net.ListenUDP("tcp", udpAddr)
-		if err != nil {
-			return err
-		}
-		s.udpConn = udpConn
-		s.udpConn.SetReadBuffer(1024 * 8) // FIXME probably
+
+	s.listenAddr = listenAddr
+	s.port = port
+	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", s.listenAddr, s.port))
+	if err != nil {
+		return err
 	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return err
+	}
+	s.udpConn = udpConn
+	s.udpConn.SetReadBuffer(1024 * 8) // FIXME probably
+
 	return nil
 }
 
-func (s *SyslogServer) SetChannel(c chan string) {
+func (s *SyslogServer) SetChannel(c chan SyslogMessage) {
 	s.channel = c
+}
+
+func (s *SyslogServer) StartServer() {
+	go func() {
+		for {
+			b := make([]byte, 1024)
+			n, addr, err := s.udpConn.ReadFrom(b)
+			if err != nil {
+				//not sure what to do ?
+				fmt.Printf("err while reading from client : %s", err)
+				continue
+			}
+			s.channel <- SyslogMessage{Message: b[:n], Client: addr.String()}
+		}
+	}()
+}
+
+func (s *SyslogServer) KillServer() error {
+	err := s.udpConn.Close()
+	if err != nil {
+		return errors.Wrap(err, "could not close UDP connection")
+	}
+	return nil
 }

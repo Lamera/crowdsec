@@ -2,11 +2,14 @@ package syslog
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/crowdsecurity/crowdsec/pkg/acquisition/configuration"
 	syslogserver "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/syslog/internal"
+	leaky "github.com/crowdsecurity/crowdsec/pkg/leakybucket"
 	"github.com/crowdsecurity/crowdsec/pkg/types"
-	"github.com/davecgh/go-spew/spew"
+	"github.com/influxdata/go-syslog/v3/rfc3164"
+	"github.com/influxdata/go-syslog/v3/rfc5424"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
@@ -80,29 +83,14 @@ func (s *SyslogSource) Configure(yamlConfig []byte, logger *log.Entry) error {
 }
 
 func (s *SyslogSource) StreamingAcquisition(out chan types.Event, t *tomb.Tomb) error {
-	//channel := make(syslog.LogPartsChannel)
-	//handler := syslog.NewChannelHandler(channel)
-
-	c := make(chan string)
+	c := make(chan syslogserver.SyslogMessage)
 	s.server = &syslogserver.SyslogServer{}
-	err := s.server.SetProtocol(s.config.Proto)
 	s.server.SetChannel(c)
-	if err != nil {
-		return errors.Wrap(err, "could not set syslog server protocol")
-	}
-	err = s.server.Listen(s.config.Addr, s.config.Port)
+	err := s.server.Listen(s.config.Addr, s.config.Port)
 	if err != nil {
 		return errors.Wrap(err, "could not start syslog server")
 	}
-	//s.server.SetHandler(handler)
-	//err := s.server.ListenUDP(fmt.Sprintf("%s:%d", s.config.Addr, s.config.Port))
-	/*if err != nil {
-		return errors.Wrap(err, "could not listen")
-	}
-	err = s.server.Boot()
-	if err != nil {
-		return errors.Wrap(err, "could not start syslog server")
-	}*/
+	s.server.StartServer()
 	t.Go(func() error {
 		defer types.CatchPanic("crowdsec/acquis/syslog/live")
 		return s.handleSyslogMsg(out, t, c)
@@ -110,31 +98,55 @@ func (s *SyslogSource) StreamingAcquisition(out chan types.Event, t *tomb.Tomb) 
 	return nil
 }
 
-func (s *SyslogSource) handleSyslogMsg(out chan types.Event, t *tomb.Tomb, c chan string) error {
+func (s *SyslogSource) handleSyslogMsg(out chan types.Event, t *tomb.Tomb, c chan syslogserver.SyslogMessage) error {
 	for {
 		select {
 		case <-t.Dying():
+			s.server.KillServer()
 			s.logger.Info("Syslog datasource is dying")
 		case syslogLine := <-c:
-			//var line string
-			spew.Dump(syslogLine)
-			//rebuild the syslog line from the part
-			//TODO: handle the RFC format and cases such as missing PID, or PID embedded in the app_name
-			/*if logParts["content"] == nil {
-				line = fmt.Sprintf("%s %s %s[%s]: %s", logParts["timestamp"], logParts["hostname"],
-					logParts["app_name"], logParts["proc_id"], logParts["message"])
+			var line string
+			var ts time.Time
+			//spew.Dump(syslogLine)
+			p := rfc5424.NewParser()
+			m, err := p.Parse(syslogLine.Message)
+			if err != nil {
+				/*	p2 := rfc3164.NewParser(rfc3164.WithYear(rfc3164.CurrentYear{}))
+					m, err = p2.Parse(syslogLine)
+					if err != nil {
+						fmt.Printf("err while parsing: %s", err)
+						continue
+					}
+					continue*/
+				s.logger.Infof("could not parse message as RFC5424, fallinb back to RFC3164 : %s", err)
+				p = rfc3164.NewParser(rfc3164.WithYear(rfc3164.CurrentYear{}))
+				m, err = p.Parse(syslogLine.Message)
+				if err != nil {
+					fmt.Printf("could not parse message as RFC3164 : %s", err)
+					continue
+				}
+				//TODO: check if the fields are not nil
+				msg := m.(*rfc3164.SyslogMessage)
+				ts = *msg.Timestamp
+				line = fmt.Sprintf("%s %s %s: %s", *msg.Timestamp, *msg.Hostname,
+					*msg.Appname, *msg.Message)
 			} else {
-				line = fmt.Sprintf("%s %s %s: %s", logParts["timestamp"],
-					logParts["hostname"], logParts["tag"], logParts["content"])
+				msg := m.(*rfc5424.SyslogMessage)
+				ts = *msg.Timestamp
+				//TODO: check if the fields are not nil
+				line = fmt.Sprintf("%s %s %s[%s]: %s", *msg.Timestamp, *msg.Hostname,
+					*msg.Appname, *msg.ProcID, *msg.Message)
 			}
+			//spew.Dump(m)
+			//rebuild the syslog line from the part
 			l := types.Line{}
 			l.Raw = line
+			//l.Module = s.GetName() // Uncomment after rebase
 			l.Labels = s.config.Labels
-			//l.Time = logParts["timestamp"].(string)
-			l.Src = logParts["client"].(string)
+			l.Time = ts
+			l.Src = syslogLine.Client
 			l.Process = true
-			out <- types.Event{Line: l, Process: true, Type: types.LOG, ExpectMode: leaky.LIVE}*/
-
+			out <- types.Event{Line: l, Process: true, Type: types.LOG, ExpectMode: leaky.LIVE}
 		}
 	}
 }
